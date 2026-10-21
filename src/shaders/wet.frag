@@ -63,6 +63,23 @@ float absorbency(vec2 uv) {
 // Water a wet pixel pushes into each dry neighbour per unit of absorbency.
 float bleedPush(vec4 s) { return u_bleed * max(s.a - 1.0 - BLEED_ABOVE, 0.0); }
 
+// The rim belongs to the moment the puddle dries, not to one edge pixel that dries early
+// (e.g. a thin bled fringe). 1 if the wet paint around this pixel is nearly out of water
+// too, 0 if it's still clearly wet.
+float puddleDrying(ivec2 p, ivec2 size) {
+  float water = 0.0;
+  float count = 0.0;
+  for (int i = 0; i < 8; i++) {
+    float a = float(i) * 0.785398;
+    vec4 s = texelFetch(u_wet, clamp(p + ivec2(round(vec2(cos(a), sin(a)) * 4.0)), ivec2(0), size - 1), 0);
+    if (s.a > 1.0) {
+      water += s.a - 1.0;
+      count += 1.0;
+    }
+  }
+  return 1.0 - smoothstep(0.03, 0.15, count > 0.0 ? water / count : 0.0);
+}
+
 void main() {
   ivec2 p = ivec2(gl_FragCoord.xy);
   ivec2 size = textureSize(u_wet, 0);
@@ -141,7 +158,7 @@ void main() {
     // bled water and dries straight away keeps only the trace of pigment it received.
     vec4 puddle = texture(u_puddle, v_uv);
     float wasWet = c.a > 1.0 ? 1.0 : 0.0; // just-dried (damp) pixels sit at exactly 1.0: not wet
-    float rim = pow(clamp((1.0 - puddle.a) * 2.0, 0.0, 1.0), 2.5) * wasWet;
+    float rim = pow(clamp((1.0 - puddle.a) * 2.0, 0.0, 1.0), 2.5) * wasWet * puddleDrying(p, size);
     vec3 puddlePigment = puddle.rgb / max(puddle.a, 0.05);
     outWet = vec4(0.0, 0.0, 0.0, 1.0); // start of the damp phase
     outDeposit = vec4(pigment + u_edgeStrength * rim * puddlePigment, 1.0);
