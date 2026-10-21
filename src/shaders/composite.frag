@@ -10,6 +10,7 @@ uniform sampler2D u_dry;      // absorbance of dried paint (rgb)
 uniform sampler2D u_wet;      // absorbance of wet paint (rgb), wetness state (a: > 1 wet)
 uniform sampler2D u_tail;     // the stroke's last stretch near the finger, not yet in the wet layer
 uniform sampler2D u_settled;  // the rest of the stroke (already in the wet layer), to avoid counting overlap twice
+uniform float u_tailCover;    // white being painted: how much of the paint under the tail it hides
 uniform float u_wetDarken;    // wet paper looks slightly darker; shows where clear water was laid
 uniform vec2 u_paperScale;    // how many times the scan repeats across the stamp (x, y)
 uniform vec3 u_paperMean;     // average paper color, the pivot for contrast
@@ -51,14 +52,17 @@ void main() {
   vec3 dry = texture(u_dry, v_uv).rgb;
   vec4 wet = texture(u_wet, v_uv);
   vec4 tail = texture(u_tail, v_uv);
-  vec3 stroke = max(tail.rgb - texture(u_settled, v_uv).rgb, 0.0);
+  vec4 settledStroke = texture(u_settled, v_uv);
+  vec3 stroke = max(tail.rgb - settledStroke.rgb, 0.0);
+  // White under the fingertip covers right away, before it settles into the layers.
+  float covering = u_tailCover * max(tail.a - settledStroke.a, 0.0);
   // Wet paint settles as it dries: wetness state goes from ~2 (fresh) down to 1 (dry).
   float settledShare = clamp(2.0 - wet.a, 0.0, 1.0);
   float wetFactor = mix(floating, settled, settledShare);
 
   // Absorbance adds up layer by layer (adding absorbance == multiplying colors): no ceiling.
-  vec3 absorbance = dry + wet.rgb + stroke;
-  vec3 granulated = dry * settled + wet.rgb * wetFactor + stroke * floating;
+  vec3 absorbance = (dry + wet.rgb) * (1.0 - covering) + stroke;
+  vec3 granulated = (dry * settled + wet.rgb * wetFactor) * (1.0 - covering) + stroke * floating;
   float total = absorbance.r + absorbance.g + absorbance.b;
   float granulationRatio = total > 0.0 ? (granulated.r + granulated.g + granulated.b) / total : 1.0;
 

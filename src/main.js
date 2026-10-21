@@ -130,12 +130,23 @@ function buildPane(onClear) {
   return pane;
 }
 
+// White (every channel at least this bright) is painted as opaque body colour, like Chinese white:
+// it covers the paint under it instead of glazing over it. All other colours stay transparent.
+const WHITE_FROM = 235;
+function isWhite(hex) {
+  const n = parseInt(hex.slice(1, 7), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255].every((v) => v >= WHITE_FROM);
+}
+
 // A stroke's look is locked in when it starts, so changing a slider mid-stroke
 // (or right after lifting) never changes a stroke that's already down.
 function currentStyle() {
+  const white = !params.waterBrush && isWhite(params.color);
   return {
-    absorbance: params.waterBrush ? [0, 0, 0] : hexToAbsorbance(params.color, params.water),
+    absorbance: params.waterBrush || white ? [0, 0, 0] : hexToAbsorbance(params.color, params.water),
     lift: params.waterBrush ? WATER_LIFT : 0,
+    // Share of the paint underneath one white stroke hides; more water = thinner white.
+    cover: white ? 0.9 - 0.6 * params.water : 0,
     radiusX: (params.brushSize / 100) * 0.5,
     waterLevel: (0.5 + params.water) / 0.8, // more water = stays wet longer; 1.0 at the default
     unevenness: params.unevenness,
@@ -320,12 +331,13 @@ async function start() {
     bindTextures(u, { u_wet: wetRead.tex, u_settled: settled.tex, u_merged: merged.tex, u_dry: dry.tex });
     gl.uniform1f(u.u_waterLevel, style.waterLevel);
     gl.uniform1f(u.u_lift, style.lift);
+    gl.uniform1f(u.u_cover, style.cover);
     gl.bindVertexArray(emptyVao);
     drawFullscreen(gl);
     swapWet();
 
-    // Water brush: the re-dissolved pigment leaves the dry layer (dry minus lift).
-    if (style.lift > 0) {
+    // Water brush / white: re-dissolved or covered pigment leaves the dry layer (dry minus lift).
+    if (style.lift > 0 || style.cover > 0) {
       const add = programs.add;
       gl.bindFramebuffer(gl.FRAMEBUFFER, dry.fbo);
       gl.useProgram(add.program);
@@ -408,6 +420,7 @@ async function start() {
     gl.disable(gl.BLEND);
   }
 
+  let tailCover = 0; // the stroke being painted, if white: how much it covers (shown before it settles)
   function composite() {
     const { program, uniforms: u } = programs.composite;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -416,6 +429,7 @@ async function start() {
     gl.useProgram(program);
     bindTextures(u, { u_paper: paperTex, u_dry: dry.tex, u_wet: wetRead.tex, u_tail: tail.tex, u_settled: settled.tex });
     gl.uniform1f(u.u_wetDarken, WET_DARKEN);
+    gl.uniform1f(u.u_tailCover, tailCover);
     gl.uniform2f(u.u_paperScale, paperScale[0], paperScale[1]);
     gl.uniform3fv(u.u_paperMean, paperMean);
     gl.uniform1f(u.u_grainContrast, params.grainContrast);
@@ -449,9 +463,11 @@ async function start() {
         mergeSettled(event.style);
         for (const t of [settled, merged, tail]) clearTarget(gl, t);
         mergeStyle = null;
+        tailCover = 0;
       } else if (event.tail) {
         clearTarget(gl, tail);
         drawStamps(tail, event.tail, event.style);
+        tailCover = event.style.cover;
       }
     }
     if (mergeStyle) mergeSettled(mergeStyle);

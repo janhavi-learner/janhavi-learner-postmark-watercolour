@@ -6,10 +6,11 @@ precision highp float;
 // is never counted twice.
 // Water brush: lays water instead of pigment, and re-dissolves part of the dried pigment
 // under it back into the wet layer, where it can spread: this is how hard edges soften.
+// White: opaque body colour. It hides part of the paint under it, wet and dried, right away.
 
 in vec2 v_uv;
 layout(location = 0) out vec4 outWet;   // next wet state: pigment (rgb), wetness state (a)
-layout(location = 1) out vec4 outLift;  // dried pigment taken back up (subtracted from the dry layer)
+layout(location = 1) out vec4 outLift;  // dried pigment taken up or covered (subtracted from the dry layer)
 
 uniform sampler2D u_wet;      // pigment absorbance (rgb), wetness state (a): > 1 wet, 0..1 damp, 0 dry
 uniform sampler2D u_settled;  // settled dabs of this stroke: absorbance (rgb), coverage (a)
@@ -17,6 +18,7 @@ uniform sampler2D u_merged;   // the part of u_settled already merged
 uniform sampler2D u_dry;      // dried pigment
 uniform float u_waterLevel;   // how much water this stroke carries (more = dries later)
 uniform float u_lift;         // share of dried pigment re-dissolved by newly wetted paper (water brush)
+uniform float u_cover;        // share of the paint underneath that newly painted white hides
 
 void main() {
   vec4 wet = texture(u_wet, v_uv);
@@ -25,10 +27,12 @@ void main() {
 
   vec3 added = max(settled.rgb - merged.rgb, 0.0);
   float newlyCovered = max(settled.a - merged.a, 0.0);
-  vec3 lifted = texture(u_dry, v_uv).rgb * u_lift * newlyCovered;
+  vec3 dry = texture(u_dry, v_uv).rgb;
+  vec3 lifted = dry * u_lift * newlyCovered;
+  float hidden = u_cover * newlyCovered;
 
   // Even the soft anti-aliased fringe counts as wet, so the puddle edge stays crisp.
   float water = settled.a > 0.01 ? 1.0 + u_waterLevel : 0.0; // wet state = 1 + water
-  outWet = vec4(wet.rgb + added + lifted, max(wet.a, water));
-  outLift = vec4(lifted, 0.0);
+  outWet = vec4(wet.rgb * (1.0 - hidden) + added + lifted, max(wet.a, water));
+  outLift = vec4(lifted + dry * hidden, 0.0);
 }
