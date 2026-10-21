@@ -11,7 +11,8 @@
 //   { commit: [...], style }    dabs that are settled: add them to the wet paint now
 //   { end: [...], style }       the stroke finished: the remaining dabs, with their final taper
 //   { tail: [...], style }      (last, while painting) the current unsettled tail, to preview
-// `style` is whatever getStyle() returned when the stroke started.
+// `style` is whatever getStyle(rect) returned when the stroke started. It must include
+// radiusPx and taperPx (in on-screen CSS pixels) for the brush's size and taper.
 
 const MIN_SIZE = 0.15;   // how thin the tips get, relative to full brush width
 const START_SHARE = 0.5; // a brush lands quickly and lifts slowly: the start taper is half the end taper
@@ -98,7 +99,7 @@ function createPressReader(canvas) {
   return reader;
 }
 
-export function createBrushInput(canvas, { getRadiusPx, getTaperPx, getPressureEffect, getStyle }) {
+export function createBrushInput(canvas, { getPressureEffect, getStyle }) {
   const queue = [];
   const press = createPressReader(canvas);
   let points = [];     // whole current stroke, 5 numbers per dab: x, y, distance-from-start, pressure size, live size
@@ -131,7 +132,7 @@ export function createBrushInput(canvas, { getRadiusPx, getTaperPx, getPressureE
   // blending pressure along the way.
   // Spacing is tight because thin tips need closely packed dabs to stay smooth.
   function lineTo(p) {
-    const spacing = Math.max(0.75, getRadiusPx(p.w) * 0.1);
+    const spacing = Math.max(0.75, style.radiusPx * 0.1);
     const dx = p.x - last.x;
     const dy = p.y - last.y;
     const dist = Math.hypot(dx, dy);
@@ -151,7 +152,7 @@ export function createBrushInput(canvas, { getRadiusPx, getTaperPx, getPressureE
   // still depends on how long it ends up.
   function commitSettled() {
     if (travelled < taperPx * (1 + START_SHARE)) return;
-    const settledBefore = travelled - taperPx - getRadiusPx(last.w);
+    const settledBefore = travelled - taperPx - style.radiusPx;
     const out = [];
     while (committed * 5 < points.length && points[committed * 5 + 2] < settledBefore) {
       const i = committed * 5;
@@ -198,11 +199,13 @@ export function createBrushInput(canvas, { getRadiusPx, getTaperPx, getPressureE
     // Capture keeps events coming if the finger slides off the canvas. Some browsers
     // (e.g. inside an embedded frame) refuse it; move/up are also heard on window below.
     try { canvas.setPointerCapture(e.pointerId); } catch { /* fine without it */ }
-    style = getStyle();
+    // Sizes are in on-screen pixels: if the app zooms the canvas with a CSS transform,
+    // the same brush paints a finer line on the paper.
+    style = getStyle(canvas.getBoundingClientRect());
     queue.push({ start: true, style });
     press.begin(e);
     last = local(e, pressSize(e));
-    taperPx = getTaperPx(last.w);
+    taperPx = style.taperPx;
     points = [];
     committed = 0;
     travelled = 0;
@@ -222,7 +225,7 @@ export function createBrushInput(canvas, { getRadiusPx, getTaperPx, getPressureE
   const end = (e) => {
     if (e.pointerId !== pointerId) return;
     pointerId = null;
-    queue.push({ end: finalDabs(getRadiusPx(last.w)), style });
+    queue.push({ end: finalDabs(style.radiusPx), style });
   };
   window.addEventListener('pointerup', end);
   window.addEventListener('pointercancel', end);

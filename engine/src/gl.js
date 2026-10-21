@@ -1,4 +1,4 @@
-// Tiny WebGL2 helpers: compile shaders (with on-screen errors), load textures,
+// Tiny WebGL2 helpers: compile shaders (errors go to the engine's error handler), load textures,
 // and draw a full-screen triangle.
 import { showError } from './errors.js';
 

@@ -1,9 +1,18 @@
-import './errors.js';
-import { Pane } from 'tweakpane';
+// The watercolor engine. Paints on a canvas you give it; the page around it is yours.
+//
+//   const engine = await createEngine(canvas, { tune: false, onError });
+//   engine.setBrush({ color: '#5f7d9c', water: 0.3, size: 32, wet: false, taper: 1.5 });
+//   engine.undo(); engine.redo(); engine.clear();
+//   engine.onHistoryChange(({ canUndo, canRedo }) => { ... });
+//   engine.resize(); // after the app changes the canvas's CSS size
+//
+// The app sizes the canvas with CSS. The canvas's shape when the engine starts is the shape
+// of the painting (Postmark's stamp is 4:5); later resizes should keep that shape.
 import {
   createContext, createProgram, loadImage, createImageTexture, drawFullscreen,
   requireFloatTargets, createTarget, createMultiTarget, clearTarget, copyTarget,
 } from './gl.js';
+import { setErrorHandler } from './errors.js';
 import { createBrushInput } from './brush.js';
 import { preparePaper } from './paper.js';
 import paperUrl from '../paper.jpg';
@@ -20,7 +29,6 @@ import noiseGlsl from './shaders/noise.glsl?raw';
 // Shaders that need the shared noise helpers mark the spot with "// #include noise".
 const withNoise = (src) => src.replace('// #include noise', noiseGlsl);
 
-const STAMP_ASPECT = 4 / 5; // width / height
 // Paint is stored at up to 1.5 pixels per CSS pixel. Watercolor is soft, so this
 // looks identical to full resolution but keeps later effects cheap on 3x phones.
 const PAINT_DENSITY = 1.5;
@@ -33,37 +41,32 @@ const HISTORY_STEPS = 20;
 const WATER_LIFT = 0.4;
 // Wet paper looks slightly darker than dry; this is how much (also shows where clear water is).
 const WET_DARKEN = 0.06;
-
-// Every visual number lives here and gets a slider.
 // After a pixel dries it stays "damp" for this fraction of the drying time.
 // Neighbours drying within that window join the same rim instead of drawing a line between them.
 const DAMP_SHARE = 0.4;
 
-const params = {
-  brushSize: 10,       // diameter, % of stamp width
-  taper: 1.5,          // length of the thin start/end, in brush widths
-  pressure: 0.7,       // 0 = pressure ignored, 1 = a light touch is very thin
-  color: '#5f7d9c',    // muted blue, as pure pigment
-  waterBrush: false,   // paint clear water instead of pigment (softens edges, re-wets dried paint)
-  water: 0.3,          // how dilute each stroke is; at 0.3 about two glazes reach the picked color
+// The brush, as the app sets it with setBrush(). Changes apply from the next stroke.
+const BRUSH_DEFAULTS = {
+  color: '#5f7d9c', // pigment colour; white is painted as opaque body colour
+  water: 0.3,       // 0 = dry brush (crisp, strong) .. 1 = soaking wet (pale, spreads, soft edges, dries slowly)
+  size: 32,         // diameter in on-screen CSS pixels
+  wet: false,       // true = water brush: clear water that re-wets and softens paint
+  taper: 1.5,       // length of the thin start/end, in brush widths
+};
+
+// Look-and-feel numbers, the same for every brush. Shown as sliders with { tune: true }.
+const TUNING_DEFAULTS = {
+  pressure: 0.7,       // how much faster strokes get thinner (0 = no effect)
   darkPace: 4,         // how fast deep glazes head toward black; they never reach it
   unevenness: 0.3,     // how blotchy a flat wash is (new strokes)
   granulation: 0.6,    // how strongly pigment settles into paper dips and clumps as it dries
   dryingTime: 20,      // seconds a stroke stays wet (at the default water amount)
-  spread: 0.5,         // how fast colors and values blend inside wet paint
+  spread: 0.5,         // how fast colours blend inside wet paint and bleed into dry paper
   edgeStrength: 3,     // how much darker the drying rim is
   edgeWidth: 3,        // how far the rim reaches into the puddle, CSS px
-  grainSize: 0.5,      // 1 = one copy of the scan across the stamp, smaller = finer grain
-  grainContrast: 1.6,
+  grainSize: 0.5,      // 1 = one copy of the paper scan across the canvas, smaller = finer grain
+  grainContrast: 1.6,  // paper grain depth
 };
-
-const canvas = document.getElementById('stamp');
-const gl = createContext(canvas);
-
-// iOS Safari ignores user-scalable=no for pinch; block its gesture events directly.
-for (const type of ['gesturestart', 'gesturechange', 'gestureend']) {
-  document.addEventListener(type, (e) => e.preventDefault(), { passive: false });
-}
 
 // Color picker hex -> how much light one stroke absorbs per channel.
 // The picked color is the rich, fully loaded pigment. Water dilutes each stroke:
@@ -75,61 +78,6 @@ function hexToAbsorbance(hex, water) {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => -Math.log(Math.max(Math.pow(v / 255, 2.2), 0.005)) * load);
 }
 
-// Fit a 4:5 stamp into the screen with a margin, rendered at device pixel ratio.
-// Some hosts (e.g. an embedded panel that is still opening) start with no size at all.
-// Paint layers need a real size, so wait until the stamp is at least this wide.
-const MIN_STAMP_PX = 80;
-function waitForSize() {
-  return new Promise((done) => {
-    const check = () => {
-      resize();
-      if (parseFloat(canvas.style.width) >= MIN_STAMP_PX) done();
-      else requestAnimationFrame(check);
-    };
-    check();
-  });
-}
-
-function resize() {
-  const margin = 24;
-  const historyRow = 44 + 12; // undo/redo buttons and the gap above them
-  const availW = window.innerWidth - margin * 2;
-  const availH = window.innerHeight - margin * 2 - historyRow;
-  const cssW = Math.max(0, Math.floor(Math.min(availW, availH * STAMP_ASPECT)));
-  const cssH = Math.floor(cssW / STAMP_ASPECT);
-  const dpr = window.devicePixelRatio || 1;
-  canvas.style.width = `${cssW}px`;
-  canvas.style.height = `${cssH}px`;
-  canvas.width = Math.round(cssW * dpr);
-  canvas.height = Math.round(cssH * dpr);
-}
-
-function buildPane(onClear) {
-  const pane = new Pane({ title: 'Tuning', expanded: false });
-  const brush = pane.addFolder({ title: 'Brush' });
-  brush.addBinding(params, 'brushSize', { label: 'size %', min: 2, max: 30, step: 0.5 });
-  brush.addBinding(params, 'taper', { label: 'taper', min: 0, max: 8, step: 0.1 });
-  brush.addBinding(params, 'pressure', { label: 'pressure', min: 0, max: 1, step: 0.01 });
-  brush.addBinding(params, 'color', { label: 'color' });
-  brush.addBinding(params, 'waterBrush', { label: 'water brush' });
-  const paint = pane.addFolder({ title: 'Paint' });
-  paint.addBinding(params, 'water', { label: 'water', min: 0, max: 1, step: 0.01 });
-  paint.addBinding(params, 'darkPace', { label: 'dark pace', min: 1, max: 8, step: 0.1 });
-  paint.addBinding(params, 'unevenness', { label: 'wash unevenness', min: 0, max: 1, step: 0.01 });
-  paint.addBinding(params, 'granulation', { label: 'granulation', min: 0, max: 1.5, step: 0.01 });
-  const wet = pane.addFolder({ title: 'Wet & drying' });
-  wet.addBinding(params, 'dryingTime', { label: 'drying time s', min: 0.5, max: 40, step: 0.5 });
-  wet.addBinding(params, 'spread', { label: 'spread speed', min: 0, max: 1, step: 0.01 });
-  const edge = pane.addFolder({ title: 'Edge darkening' });
-  edge.addBinding(params, 'edgeStrength', { label: 'strength', min: 0, max: 5, step: 0.05 });
-  edge.addBinding(params, 'edgeWidth', { label: 'width px', min: 1, max: 20, step: 0.5 });
-  const paper = pane.addFolder({ title: 'Paper' });
-  paper.addBinding(params, 'grainSize', { label: 'grain size', min: 0.15, max: 1.5, step: 0.01 });
-  paper.addBinding(params, 'grainContrast', { label: 'grain depth', min: 0, max: 4, step: 0.05 });
-  pane.addButton({ title: 'Clear' }).on('click', onClear);
-  return pane;
-}
-
 // White (every channel at least this bright) is painted as opaque body colour, like Chinese white:
 // it covers the paint under it instead of glazing over it. All other colours stay transparent.
 const WHITE_FROM = 235;
@@ -138,24 +86,42 @@ function isWhite(hex) {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255].every((v) => v >= WHITE_FROM);
 }
 
-// A stroke's look is locked in when it starts, so changing a slider mid-stroke
+// A stroke's look is locked in when it starts, so changing the brush mid-stroke
 // (or right after lifting) never changes a stroke that's already down.
-function currentStyle() {
-  const white = !params.waterBrush && isWhite(params.color);
+// `rect` is the canvas as it appears on screen (after any CSS zoom).
+function strokeStyle(brush, tuning, rect) {
+  const white = !brush.wet && isWhite(brush.color);
+  const radiusPx = brush.size / 2;
   return {
-    absorbance: params.waterBrush || white ? [0, 0, 0] : hexToAbsorbance(params.color, params.water),
-    lift: params.waterBrush ? WATER_LIFT : 0,
+    absorbance: brush.wet || white ? [0, 0, 0] : hexToAbsorbance(brush.color, brush.water),
+    lift: brush.wet ? WATER_LIFT : 0,
     // Share of the paint underneath one white stroke hides; more water = thinner white.
-    cover: white ? 0.9 - 0.6 * params.water : 0,
-    radiusX: (params.brushSize / 100) * 0.5,
-    waterLevel: (0.5 + params.water) / 0.8, // more water = stays wet longer; 1.0 at the default
-    unevenness: params.unevenness,
+    cover: white ? 0.9 - 0.6 * brush.water : 0,
+    radiusPx,
+    taperPx: brush.taper * brush.size,
+    radiusX: radiusPx / Math.max(rect.width, 1), // in 0..1 of the canvas width
+    waterLevel: (0.5 + brush.water) / 0.8, // more water = stays wet longer; 1.0 at the default
+    unevenness: tuning.unevenness,
     seed: [Math.random() * 100, Math.random() * 100], // each stroke gets its own blotches
   };
 }
 
-async function start() {
-  if (!gl || !requireFloatTargets(gl)) return;
+// Some hosts (e.g. an embedded panel that is still opening) start with no size at all.
+// Paint layers need a real size, so wait until the canvas has one.
+function waitForSize(canvas) {
+  return new Promise((done) => {
+    const check = () => {
+      if (canvas.clientWidth >= 1 && canvas.clientHeight >= 1) done();
+      else requestAnimationFrame(check);
+    };
+    check();
+  });
+}
+
+export async function createEngine(canvas, { tune = false, onError } = {}) {
+  if (onError) setErrorHandler(onError);
+  const gl = createContext(canvas);
+  if (!gl || !requireFloatTargets(gl)) throw new Error('This browser cannot run the watercolor engine (WebGL2 with float render targets).');
   const programs = {
     composite: createProgram(gl, fullscreenVert, withNoise(compositeFrag), 'composite'),
     stamp: createProgram(gl, stampVert, withNoise(stampFrag), 'stamp'),
@@ -164,7 +130,24 @@ async function start() {
     merge: createProgram(gl, fullscreenVert, mergeFrag, 'merge'),
     wet: createProgram(gl, fullscreenVert, withNoise(wetFrag), 'wet'),
   };
-  if (Object.values(programs).some((p) => !p)) return;
+  if (Object.values(programs).some((p) => !p)) throw new Error('A watercolor shader failed to compile (details were reported to onError).');
+
+  const brush = { ...BRUSH_DEFAULTS };
+  const tuning = { ...TUNING_DEFAULTS };
+
+  // The engine paints with one finger; the canvas must not scroll or zoom the page.
+  canvas.style.touchAction = 'none';
+
+  // Render at device pixel ratio; the app decides the CSS size.
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    canvas.height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+  }
+  await waitForSize(canvas);
+  resize();
+  const layoutW = canvas.clientWidth;      // CSS width when the engine started
+  const aspect = layoutW / canvas.clientHeight; // width / height of the painting
 
   const paperImage = await loadImage(paperUrl);
   const paper = preparePaper(paperImage);
@@ -174,15 +157,13 @@ async function start() {
   const paperAspect = paperImage.width / paperImage.height; // width / height
   const paperMeanLum = 0.299 * paperMean[0] + 0.587 * paperMean[1] + 0.114 * paperMean[2];
   // How many times the scan repeats across / down the stamp, without stretching it.
-  const paperRepeat = () => [1 / params.grainSize, paperAspect / STAMP_ASPECT / params.grainSize];
+  const paperRepeat = () => [1 / tuning.grainSize, paperAspect / aspect / tuning.grainSize];
 
-  await waitForSize();
-  window.addEventListener('resize', resize);
-
-  // Paint layers are created once and addressed in 0..1 coordinates,
-  // so a resize never wipes or distorts the painting.
-  const paintW = Math.min(Math.round(parseFloat(canvas.style.width) * PAINT_DENSITY), PAINT_MAX_W);
-  const paintH = Math.round(paintW / STAMP_ASPECT);
+  // Paint layers are created once, from the canvas size at start, and addressed in 0..1
+  // coordinates, so a resize never wipes or distorts the painting.
+  const paintW = Math.min(Math.round(layoutW * PAINT_DENSITY), PAINT_MAX_W);
+  const paintH = Math.round(paintW / aspect);
+  const paintPerCss = paintW / layoutW; // paint pixels per CSS pixel of the canvas
   // The stroke being painted, in three parts:
   const settled = createTarget(gl, paintW, paintH); // dabs that won't change shape any more
   const merged = createTarget(gl, paintW, paintH);  // the part of `settled` already added to the wet paint
@@ -213,15 +194,13 @@ async function start() {
   let simSinceMerge = Infinity;
   // Nothing can still be wet after this long (wettest stroke + damp phase, with margin).
   // Uses the current slider, so raising the drying time mid-way never freezes paint half-wet.
-  const mayBeWet = () => simSinceMerge < (((0.5 + 1) / 0.8) * 1.2 + DAMP_SHARE) * params.dryingTime + 1;
+  const mayBeWet = () => simSinceMerge < (((0.5 + 1) / 0.8) * 1.2 + DAMP_SHARE) * tuning.dryingTime + 1;
 
   const swapWet = () => { [wetRead, wetWrite] = [wetWrite, wetRead]; };
 
   const brushInput = createBrushInput(canvas, {
-    getRadiusPx: (cssW) => (params.brushSize / 100) * cssW * 0.5,
-    getTaperPx: (cssW) => params.taper * (params.brushSize / 100) * cssW,
-    getPressureEffect: () => params.pressure,
-    getStyle: currentStyle,
+    getPressureEffect: () => tuning.pressure,
+    getStyle: (rect) => strokeStyle(brush, tuning, rect),
   });
 
   // --- Undo / redo: a copy of the dried and wet paint before each step.
@@ -230,8 +209,7 @@ async function start() {
   const takeLayer = () => spare.pop() || createTarget(gl, paintW, paintH);
   const undoStack = [];
   const redoStack = [];
-  const undoButton = document.getElementById('undo');
-  const redoButton = document.getElementById('redo');
+  const historyListeners = new Set();
 
   function snapshot() {
     // Nothing wet? Then there's no need to keep a copy of the (empty) wet layer.
@@ -251,9 +229,10 @@ async function start() {
     simSinceMerge = snap.sim; // wet paint carries on drying from where it was
     release(snap);
   }
+  const historyState = () => ({ canUndo: undoStack.length > 0, canRedo: redoStack.length > 0 });
   function updateHistoryButtons() {
-    undoButton.disabled = undoStack.length === 0;
-    redoButton.disabled = redoStack.length === 0;
+    const state = historyState();
+    historyListeners.forEach((cb) => cb(state));
   }
   // Call before a step changes the painting.
   function rememberStep() {
@@ -268,14 +247,13 @@ async function start() {
     restore(from.pop());
     updateHistoryButtons();
   }
-  undoButton.addEventListener('click', () => stepBack(undoStack, redoStack));
-  redoButton.addEventListener('click', () => stepBack(redoStack, undoStack));
-
-  buildPane(() => {
+  // Clear is one undo step.
+  function clear() {
+    if (brushInput.painting) return;
     rememberStep();
     for (const t of [settled, merged, tail, dry, wetRead, wetWrite]) clearTarget(gl, t);
     simSinceMerge = Infinity;
-  });
+  }
 
   const emptyVao = gl.createVertexArray();
   const stampVao = gl.createVertexArray();
@@ -303,14 +281,14 @@ async function start() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
     gl.viewport(0, 0, paintW, paintH);
     gl.useProgram(program);
-    gl.uniform2f(u.u_radius, radiusX, radiusX * STAMP_ASPECT);
+    gl.uniform2f(u.u_radius, radiusX, radiusX * aspect);
     gl.uniform1f(u.u_radiusPx, radiusPx);
     gl.uniform1f(u.u_edgePx, 1.5);
     gl.uniform3fv(u.u_absorbance, style.absorbance);
     gl.uniform1f(u.u_unevenness, style.unevenness);
     gl.uniform2f(u.u_seed, style.seed[0], style.seed[1]);
-    // Blotches about a tenth of the stamp across, kept round on the 4:5 stamp.
-    gl.uniform2f(u.u_blotchScale, 10, 10 / STAMP_ASPECT);
+    // Blotches about a tenth of the canvas across, kept round whatever its shape.
+    gl.uniform2f(u.u_blotchScale, 10, 10 / aspect);
     gl.bindVertexArray(stampVao);
     gl.bindBuffer(gl.ARRAY_BUFFER, stampBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(dabs), gl.STREAM_DRAW);
@@ -357,7 +335,7 @@ async function start() {
   // Blur the wet area's shape (across, then down) so drying pixels know how close they are to the puddle edge.
   function blurPuddleShape() {
     const { program, uniforms: u } = programs.blur;
-    const sigmaPx = (params.edgeWidth * PAINT_DENSITY) / 2; // CSS px -> half-res paint px
+    const sigmaPx = (tuning.edgeWidth * paintPerCss) / 2; // CSS px -> half-res paint px
     gl.useProgram(program);
     gl.viewport(0, 0, halfW, halfH);
     gl.bindVertexArray(emptyVao);
@@ -386,11 +364,10 @@ async function start() {
     gl.uniform1f(u.u_paperMeanLum, paperMeanLum);
     gl.uniform1f(u.u_paperStd, paperStd);
     // Fibres about 1.5 CSS px across.
-    const cssW = parseFloat(canvas.style.width);
-    gl.uniform2f(u.u_fiberScale, cssW / 1.5, cssW / STAMP_ASPECT / 1.5);
+    gl.uniform2f(u.u_fiberScale, layoutW / 1.5, layoutW / aspect / 1.5);
     // Neighbour distance grows with spread speed; its direction turns by the golden angle each step.
     // Every other step uses the nearest pixel, so all pixels stay linked to each other.
-    const reachPx = stepCount % 2 ? 1 : 1 + 4 * params.spread;
+    const reachPx = stepCount % 2 ? 1 : 1 + 4 * tuning.spread;
     const angle = stepCount++ * 2.39996;
     let ox = Math.round(Math.cos(angle) * reachPx);
     let oy = Math.round(Math.sin(angle) * reachPx);
@@ -398,13 +375,13 @@ async function start() {
     gl.uniform2i(u.u_offset, ox, oy);
     // Flow per step scales with frame time, so 60Hz and 120Hz screens blend at the same speed.
     const perStep = Math.min(dt * 60, 1);
-    gl.uniform1f(u.u_pigmentFlow, params.spread > 0 ? 0.24 * perStep : 0);
+    gl.uniform1f(u.u_pigmentFlow, tuning.spread > 0 ? 0.24 * perStep : 0);
     gl.uniform1f(u.u_waterFlow, 0.24 * perStep);
     // Outward bleeding follows spread speed too (0.5 = the default rate).
-    gl.uniform1f(u.u_bleed, 0.5 * params.spread * perStep);
-    gl.uniform1f(u.u_evaporate, (dt * 0.8) / params.dryingTime);
-    gl.uniform1f(u.u_dampFade, dt / (DAMP_SHARE * params.dryingTime));
-    gl.uniform1f(u.u_edgeStrength, params.edgeStrength);
+    gl.uniform1f(u.u_bleed, 0.5 * tuning.spread * perStep);
+    gl.uniform1f(u.u_evaporate, (dt * 0.8) / tuning.dryingTime);
+    gl.uniform1f(u.u_dampFade, dt / (DAMP_SHARE * tuning.dryingTime));
+    gl.uniform1f(u.u_edgeStrength, tuning.edgeStrength);
     gl.bindVertexArray(emptyVao);
     drawFullscreen(gl);
     swapWet();
@@ -432,19 +409,21 @@ async function start() {
     gl.uniform1f(u.u_tailCover, tailCover);
     gl.uniform2f(u.u_paperScale, paperScale[0], paperScale[1]);
     gl.uniform3fv(u.u_paperMean, paperMean);
-    gl.uniform1f(u.u_grainContrast, params.grainContrast);
-    gl.uniform1f(u.u_darkPace, params.darkPace);
-    gl.uniform1f(u.u_granulation, params.granulation);
+    gl.uniform1f(u.u_grainContrast, tuning.grainContrast);
+    gl.uniform1f(u.u_darkPace, tuning.darkPace);
+    gl.uniform1f(u.u_granulation, tuning.granulation);
     // Pigment clumps about 2 CSS px across, whatever the phone's pixel density.
-    const cssW = parseFloat(canvas.style.width);
-    gl.uniform2f(u.u_clumpScale, cssW / 2, cssW / STAMP_ASPECT / 2);
+    gl.uniform2f(u.u_clumpScale, layoutW / 2, layoutW / aspect / 2);
     gl.uniform1f(u.u_paperStd, paperStd);
     gl.bindVertexArray(emptyVao);
     drawFullscreen(gl);
   }
 
+
   let lastTime = 0;
+  let running = true;
   function frame(ms) {
+    if (!running) return;
     const now = ms / 1000;
     const dt = Math.min(lastTime ? now - lastTime : 1 / 60, 1 / 20); // cap so a hiccup doesn't dry paint in one jump
     lastTime = now;
@@ -481,6 +460,31 @@ async function start() {
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
-}
 
-start();
+  const pane = tune ? await createTuningPaneLazily() : null;
+  async function createTuningPaneLazily() {
+    const { createTuningPane } = await import('./tuning.js');
+    return createTuningPane({ tuning, brush, onClear: clear });
+  }
+
+  return {
+    // Re-read the canvas's CSS size (call after the app resizes it).
+    resize,
+    // Change the brush; values apply from the next stroke. Unknown keys are ignored.
+    setBrush(next) {
+      for (const key of Object.keys(BRUSH_DEFAULTS)) {
+        if (next[key] !== undefined) brush[key] = next[key];
+      }
+      pane?.refresh();
+    },
+    undo: () => stepBack(undoStack, redoStack),
+    redo: () => stepBack(redoStack, undoStack),
+    clear,
+    // Called now with the current state, then on every change. Returns a function that unsubscribes.
+    onHistoryChange(cb) {
+      historyListeners.add(cb);
+      cb(historyState());
+      return () => historyListeners.delete(cb);
+    },
+  };
+}
