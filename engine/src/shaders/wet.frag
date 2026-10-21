@@ -36,6 +36,7 @@ uniform float u_bleed;           // how fast very wet paint pushes into dry pape
 uniform float u_evaporate;       // water lost this step
 uniform float u_dampFade;        // how much of the damp phase passes this step
 uniform float u_edgeStrength;    // extra pigment at the rim when it dries, relative to the puddle's own
+uniform float u_probePx;         // how far to look (paint px) when checking if the puddle around is drying
 
 // Paint layers are half-float: around 1.0 they can only store steps of ~0.001. A state saved
 // just above 1.0 could round down to exactly 1.0 and read as "already dry", skipping the
@@ -71,7 +72,7 @@ float puddleDrying(ivec2 p, ivec2 size) {
   float count = 0.0;
   for (int i = 0; i < 8; i++) {
     float a = float(i) * 0.785398;
-    vec4 s = texelFetch(u_wet, clamp(p + ivec2(round(vec2(cos(a), sin(a)) * 4.0)), ivec2(0), size - 1), 0);
+    vec4 s = texelFetch(u_wet, clamp(p + ivec2(round(vec2(cos(a), sin(a)) * u_probePx)), ivec2(0), size - 1), 0);
     if (s.a > 1.0) {
       water += s.a - 1.0;
       count += 1.0;
@@ -121,23 +122,23 @@ void main() {
     state = c.a + u_waterFlow * dWater - bledOut - u_evaporate;
   } else {
     // Dry or damp: soak up water (and some pigment) from very wet neighbours, if any.
-    float soak = absorbency(v_uv);
     float bledIn = 0.0;
     vec3 pigmentIn = vec3(0.0);
     for (int i = 0; i < 4; i++) {
       float push = n[i].a > 1.0 ? bleedPush(n[i]) : 0.0;
       if (push <= 0.0) continue;
-      float f = push * soak;
-      bledIn += f;
-      pigmentIn += n[i].rgb / max(n[i].a - 1.0, 1e-3) * f * BLEED_CARRY;
+      bledIn += push;
+      pigmentIn += n[i].rgb / max(n[i].a - 1.0, 1e-3) * push * BLEED_CARRY;
     }
     if (bledIn <= 0.0) {
       // Nothing arrives: damp slowly turns fully dry.
       outWet = vec4(0.0, 0.0, 0.0, max(c.a - u_dampFade, 0.0));
       return;
     }
-    pigment = pigmentIn;
-    state = 1.0 + bledIn - u_evaporate;
+    // How readily this spot soaks it up (only looked up when something arrives: it's costly).
+    float soak = absorbency(v_uv);
+    pigment = pigmentIn * soak;
+    state = 1.0 + bledIn * soak - u_evaporate;
     if (state <= DRY_LINE) {
       // Only a trace arrived and it dried at once: keep the trace of pigment, but the paper
       // stays as it was. Marking it damp would make the puddle look wider than its wet part

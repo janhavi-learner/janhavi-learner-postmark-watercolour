@@ -5,6 +5,7 @@ precision highp float;
 in vec2 v_uv;
 out vec4 outColor;
 
+uniform vec3 u_view;         // zoom: scale, then the painting point (0..1, y up) at the centre
 uniform sampler2D u_paper;
 uniform sampler2D u_dry;      // absorbance of dried paint (rgb)
 uniform sampler2D u_wet;      // absorbance of wet paint (rgb), wetness state (a: > 1 wet)
@@ -26,8 +27,11 @@ vec3 toSrgb(vec3 c)   { return pow(c, vec3(1.0 / 2.2)); }
 // #include noise
 
 void main() {
+  // Which point of the painting this screen pixel shows.
+  vec2 puv = (v_uv - 0.5) / u_view.x + u_view.yz;
+
   // The paper tile (made seamless at load) repeats to make the grain finer.
-  vec3 paper = texture(u_paper, v_uv * u_paperScale).rgb;
+  vec3 paper = texture(u_paper, puv * u_paperScale).rgb;
 
   // Bump height from brightness: lit paper peaks are lighter, dips are darker. -1 (dip) .. 1 (peak).
   float lum = dot(paper, vec3(0.299, 0.587, 0.114));
@@ -43,16 +47,16 @@ void main() {
   // -1..1, zero on average, so pigment is moved around rather than added.
   // Specks follow the paper's dips first; clumps (small flocks of particles) add irregularity,
   // and a large slow pattern makes some areas of a wash granulate more than others.
-  float clump = valueNoise(v_uv * u_clumpScale) * 0.6 + valueNoise(v_uv * u_clumpScale * 0.45) * 0.4;
-  float patches = mix(0.35, 1.25, valueNoise(v_uv * u_clumpScale * 0.08));
+  float clump = valueNoise(puv * u_clumpScale) * 0.6 + valueNoise(puv * u_clumpScale * 0.45) * 0.4;
+  float patches = mix(0.35, 1.25, valueNoise(puv * u_clumpScale * 0.08));
   float settle = clamp(-bump * 0.75 + (clump - 0.5) * 0.9, -1.0, 1.0) * patches;
   // Dips gain more than peaks lose: specks read as dark pigment, not as holes in the paint.
   float settled = max(1.0 + u_granulation * (settle > 0.0 ? 1.5 : 0.8) * settle, 0.0);
 
-  vec3 dry = texture(u_dry, v_uv).rgb;
-  vec4 wet = texture(u_wet, v_uv);
-  vec4 tail = texture(u_tail, v_uv);
-  vec4 settledStroke = texture(u_settled, v_uv);
+  vec3 dry = texture(u_dry, puv).rgb;
+  vec4 wet = texture(u_wet, puv);
+  vec4 tail = texture(u_tail, puv);
+  vec4 settledStroke = texture(u_settled, puv);
   vec3 stroke = max(tail.rgb - settledStroke.rgb, 0.0);
   // White under the fingertip covers right away, before it settles into the layers.
   float covering = u_tailCover * max(tail.a - settledStroke.a, 0.0);

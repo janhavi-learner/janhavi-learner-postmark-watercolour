@@ -24,7 +24,7 @@ export async function createTuningPane({ tuning, brush, onClear }) {
 
   const edge = pane.addFolder({ title: 'Edge darkening' });
   edge.addBinding(tuning, 'edgeStrength', { label: 'strength', min: 0, max: 5, step: 0.05 });
-  edge.addBinding(tuning, 'edgeWidth', { label: 'width px', min: 1, max: 20, step: 0.5 });
+  edge.addBinding(tuning, 'edgeWidth', { label: 'width px', min: 1, max: 40, step: 0.5 });
 
   const paper = pane.addFolder({ title: 'Paper' });
   paper.addBinding(tuning, 'grainSize', { label: 'grain size', min: 0.15, max: 1.5, step: 0.01 });

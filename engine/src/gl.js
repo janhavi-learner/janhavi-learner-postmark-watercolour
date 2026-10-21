@@ -104,6 +104,48 @@ export function createTarget(gl, width, height) {
   return { tex, fbo, width, height };
 }
 
+// A half-float texture with mipmap levels, drawn into at full size. After drawing, call
+// gl.generateMipmap so shaders can read it at a coarser level (cheap wide blurs).
+export function createMipTarget(gl, width, height) {
+  const levels = Math.floor(Math.log2(Math.max(width, height))) + 1;
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texStorage2D(gl.TEXTURE_2D, levels, gl.RGBA16F, width, height);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if (status !== gl.FRAMEBUFFER_COMPLETE) showError(`Mip framebuffer incomplete (0x${status.toString(16)}).`);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo, width, height };
+}
+
+// An 8-bit colour texture to draw into and read back (used for the small preview).
+export function createByteTarget(gl, width, height) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo, width, height };
+}
+
+// Copies a rectangle between two framebuffers (same pixel format).
+export function copyRect(gl, srcFbo, sx, sy, dstFbo, dx, dy, w, h) {
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, srcFbo);
+  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dstFbo);
+  gl.blitFramebuffer(sx, sy, sx + w, sy + h, dx, dy, dx + w, dy + h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+  gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+}
+
 // A framebuffer that writes to several textures at once (one per `out` in the shader).
 export function createMultiTarget(gl, textures) {
   const fbo = gl.createFramebuffer();
