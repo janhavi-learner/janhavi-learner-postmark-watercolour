@@ -1,0 +1,18 @@
+{
+  "name": "postmark-watercolor",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "build:single": "vite build --mode single"
+  },
+  "dependencies": {
+    "tweakpane": "^4.0.5"
+  },
+  "devDependencies": {
+    "vite": "^6.4.5",
+    "vite-plugin-singlefile": "^2.3.4"
+  }
+}
