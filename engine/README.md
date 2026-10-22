@@ -49,7 +49,9 @@ screen, unzoomed, with the paper at full resolution.
   and gets softer edges. Near 0 the edge stays crisp.
 - `size`: diameter in CSS pixels **on screen**. Zoomed in with `setView`, the same size paints a finer
   line on the paper (at scale 4 a 6px brush is 1.5px on the unzoomed stamp).
-- `wet`: `true` = water brush (clear water that re-wets dried paint and softens edges).
+- `wet`: `true` = water brush. It only blends: colours and values under it mix softly with their
+  neighbours (dried with dried, wet with wet), reaching about a quarter of the brush's width. It adds
+  no water or pigment and changes no wetness, so it leaves no new edges, rims or blooms.
 - `taper`: length of the thin start/end, in brush widths (0 = none).
 - `offsetPx`: paint lands this many on-screen pixels above the finger (0 = under the finger).
 - `offsetRampPx`: the offset starts at 0 and grows smoothly to `offsetPx` over this much finger movement.

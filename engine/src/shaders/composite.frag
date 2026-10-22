@@ -12,7 +12,8 @@ uniform sampler2D u_wet;      // absorbance of wet paint (rgb), wetness state (a
 uniform sampler2D u_tail;     // the stroke's last stretch near the finger, not yet in the wet layer
 uniform sampler2D u_settled;  // the rest of the stroke (already in the wet layer), to avoid counting overlap twice
 uniform float u_tailCover;    // white being painted: how much of the paint under the tail it hides
-uniform float u_wetDarken;    // wet paper looks slightly darker; shows where clear water was laid
+uniform float u_wetDarken;    // wet paper looks slightly darker
+uniform float u_tailWet;      // 1 if the stroke being painted lays water (0 for the water brush, which only blends)
 uniform vec2 u_paperScale;    // how many times the scan repeats across the stamp (x, y)
 uniform vec3 u_paperMean;     // average paper color, the pivot for contrast
 uniform float u_grainContrast; // 1 = scan as-is, >1 = deeper tooth, <1 = smoother
@@ -81,7 +82,7 @@ void main() {
   absorbance *= granulationRatio;
 
   vec3 lit = toLinear(paper) * exp(-absorbance);
-  float wetness = max(smoothstep(1.0, 1.1, wet.a), tail.a);
+  float wetness = max(smoothstep(1.0, 1.1, wet.a), tail.a * u_tailWet);
   lit *= 1.0 - u_wetDarken * wetness;
   outColor = vec4(toSrgb(lit), 1.0);
 }

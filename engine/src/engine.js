@@ -29,6 +29,7 @@ import maskFrag from './shaders/mask.frag?raw';
 import mergeFrag from './shaders/merge.frag?raw';
 import coverFrag from './shaders/cover.frag?raw';
 import liftFrag from './shaders/lift.frag?raw';
+import blendFrag from './shaders/blend.frag?raw';
 import restoreFrag from './shaders/restore.frag?raw';
 import wetFrag from './shaders/wet.frag?raw';
 import noiseGlsl from './shaders/noise.glsl?raw';
@@ -61,8 +62,9 @@ const FAST_STEP_FRESH = 1 / 30;
 const FRESH_SECONDS = 6;
 const FAST_STEPS_PER_FRAME = 6;
 
-// Water brush: share of the dried pigment under it that dissolves back into the wet paint.
-const WATER_LIFT = 0.4;
+// Water brush: blends paint across about this share of the brush's width (radius of the blend
+// relative to the brush radius).
+const BLEND_REACH = 0.5;
 // Wet paper looks slightly darker than dry; this is how much (also shows where clear water is).
 const WET_DARKEN = 0.06;
 // After a pixel dries it stays "damp" for this fraction of the drying time.
@@ -121,7 +123,7 @@ function strokeStyle(brush, tuning, rect, scale) {
   const radiusPx = brush.size / 2;
   return {
     absorbance: brush.wet || white ? [0, 0, 0] : hexToAbsorbance(brush.color, brush.water),
-    lift: brush.wet ? WATER_LIFT : 0,
+    blend: brush.wet, // the water brush only blends: it adds no water and no pigment
     // Share of the paint underneath one white stroke hides; more water = thinner white.
     cover: white ? 0.9 - 0.6 * brush.water : 0,
     radiusPx,
@@ -161,6 +163,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     merge: createProgram(gl, fullscreenVert, mergeFrag, 'merge'),
     cover: createProgram(gl, fullscreenVert, coverFrag, 'cover'),
     lift: createProgram(gl, fullscreenVert, liftFrag, 'lift'),
+    blend: createProgram(gl, fullscreenVert, blendFrag, 'blend'),
     restore: createProgram(gl, fullscreenVert, restoreFrag, 'restore'),
     wet: createProgram(gl, fullscreenVert, withNoise(wetFrag), 'wet'),
   };
@@ -443,6 +446,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     gl.uniform1f(u.u_radiusPx, radiusX * W);
     gl.uniform1f(u.u_edgePx, 1.5);
     gl.uniform3fv(u.u_absorbance, style.absorbance);
+    gl.uniform1f(u.u_softDab, style.blend ? 1 : 0);
     gl.uniform1f(u.u_unevenness, style.unevenness);
     gl.uniform2f(u.u_seed, style.seed[0], style.seed[1]);
     // Blotches about a tenth of the painting across, kept round whatever its shape.
@@ -475,6 +479,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
   // Runs every frame while painting, only over the area under the brush, so blending starts
   // right behind the brush.
   function mergeSettled(style, area) {
+    if (style.blend) return blendSettled(style, area);
     const tiles = tilesIn(area, MARGIN_TILES);
     if (activeStep) touch(activeStep, tiles); // save these tiles for undo before changing them
     for (const i of tiles) {
@@ -488,15 +493,15 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     gl.viewport(0, 0, W, H);
     gl.bindVertexArray(emptyVao);
     scissorTo(r);
-    const takesFromDry = style.lift + style.cover > 0;
+    const takesFromDry = style.cover > 0;
 
-    // Water brush / white: what leaves the dry layer here.
+    // White: what it hides in the dry layer here.
     if (takesFromDry) {
       const { program, uniforms: u } = programs.lift;
       gl.bindFramebuffer(gl.FRAMEBUFFER, transfer.fbo);
       gl.useProgram(program);
       bindTextures(u, { u_settled: settled.tex, u_merged: merged.tex, u_dry: dry.tex });
-      gl.uniform1f(u.u_share, style.lift + style.cover);
+      gl.uniform1f(u.u_share, style.cover);
       drawFullscreen(gl);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, wetRead.fbo);
@@ -513,14 +518,13 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     // New pigment and water: pigment adds, water level is topped up (max).
     const { program, uniforms: u } = programs.merge;
     gl.useProgram(program);
-    bindTextures(u, { u_settled: settled.tex, u_merged: merged.tex, u_dry: dry.tex });
+    bindTextures(u, { u_settled: settled.tex, u_merged: merged.tex });
     gl.uniform1f(u.u_waterLevel, style.waterLevel);
-    gl.uniform1f(u.u_lift, style.lift);
     gl.blendEquationSeparate(gl.FUNC_ADD, gl.MAX);
     gl.blendFunc(gl.ONE, gl.ONE);
     drawFullscreen(gl);
     gl.blendEquation(gl.FUNC_ADD);
-    // ...and the dry layer gives up what was dissolved or covered (dry minus transfer).
+    // ...and the dry layer gives up what white covered (dry minus transfer).
     if (takesFromDry) {
       const add = programs.add;
       gl.bindFramebuffer(gl.FRAMEBUFFER, dry.fbo);
@@ -532,6 +536,31 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     }
     gl.disable(gl.BLEND);
     gl.disable(gl.SCISSOR_TEST);
+    copyRect(gl, settled.fbo, r.x, r.y, merged.fbo, r.x, r.y, r.w, r.h);
+  }
+
+  // Water brush: blend the paint newly under the brush with its neighbours (dried with dried, wet
+  // with wet). Adds no water or pigment and leaves wetness as it was, so no rim or bloom follows.
+  function blendSettled(style, area) {
+    const reach = style.radiusX * W * BLEND_REACH; // paint px
+    const grown = { x0: area.x0 - reach, y0: area.y0 - reach, x1: area.x1 + reach, y1: area.y1 + reach };
+    if (activeStep) touch(activeStep, tilesIn(grown, MARGIN_TILES)); // save for undo before changing
+    const r = { x: Math.max(0, Math.floor(area.x0)), y: Math.max(0, Math.floor(area.y0)) };
+    r.w = Math.min(W, Math.ceil(area.x1) + 1) - r.x;
+    r.h = Math.min(H, Math.ceil(area.y1) + 1) - r.y;
+    if (r.w <= 0 || r.h <= 0) return;
+    const { program, uniforms: u } = programs.blend;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, wetStepFbo.get(wetRead)); // writes wetWrite + transfer
+    gl.viewport(0, 0, W, H);
+    scissorTo(r);
+    gl.useProgram(program);
+    bindTextures(u, { u_wet: wetRead.tex, u_dry: dry.tex, u_settled: settled.tex, u_merged: merged.tex });
+    gl.uniform1f(u.u_radiusPx, Math.max(2, reach));
+    gl.bindVertexArray(emptyVao);
+    drawFullscreen(gl);
+    gl.disable(gl.SCISSOR_TEST);
+    copyRect(gl, wetWrite.fbo, r.x, r.y, wetRead.fbo, r.x, r.y, r.w, r.h);
+    copyRect(gl, transfer.fbo, r.x, r.y, dry.fbo, r.x, r.y, r.w, r.h);
     copyRect(gl, settled.fbo, r.x, r.y, merged.fbo, r.x, r.y, r.w, r.h);
   }
 
@@ -586,11 +615,15 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
   // Only runs inside the rectangle that may be wet. finishDrying uses long steps (up to 1/10 s),
   // and `blur: false` reuses the last rim blur to save time.
   let stepCount = 0;
-  function wetStep(dt, { blur = true, forceDry = false } = {}) {
-    const bounds = wetBounds();
+  let lastBounds = null;
+  function wetStep(dt, { blur = true, forceDry = false, area = null } = {}) {
+    const bounds = area || wetBounds();
     if (!bounds) {
-      // Everything has dried: make sure both wet layers are empty, then stop until the next stroke.
+      // Everything should have dried. Any pixel still holding water (e.g. the drying time was
+      // shortened mid-way) dries now, with its rim, so no paint is ever lost; then both wet
+      // layers are emptied until the next stroke.
       if (wasWet) {
+        wetStep(dt, { forceDry: true, area: lastBounds });
         clearTarget(gl, wetRead);
         clearTarget(gl, wetWrite);
         wasWet = false;
@@ -598,6 +631,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
       return;
     }
     wasWet = true;
+    lastBounds = bounds;
     if (blur || !puddle) blurPuddleShape(bounds);
 
     const { program, uniforms: u } = programs.wet;
@@ -652,6 +686,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
   }
 
   let tailCover = 0; // the stroke being painted, if white: how much it covers (shown before it settles)
+  let tailWet = 1;   // 0 while the water brush is going: it lays no water, so nothing looks wet
   // Draw the painting on paper into `fbo` (null = the canvas), `w` × `h` pixels, through `v`.
   function composite(fbo, w, h, v) {
     const { program, uniforms: u } = programs.composite;
@@ -663,6 +698,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     gl.uniform3f(u.u_view, v.scale, v.x, 1 - v.y);
     gl.uniform1f(u.u_wetDarken, WET_DARKEN);
     gl.uniform1f(u.u_tailCover, tailCover);
+    gl.uniform1f(u.u_tailWet, tailWet);
     gl.uniform2f(u.u_paperScale, paperScale[0], paperScale[1]);
     gl.uniform3fv(u.u_paperMean, paperMean);
     gl.uniform1f(u.u_grainContrast, tuning.grainContrast);
@@ -739,6 +775,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
         clearTarget(gl, tail);
         drawStamps(tail, event.tail, event.style);
         tailCover = event.style.cover;
+        tailWet = event.style.blend ? 0 : 1;
       }
     }
     if (mergeStyle) mergeSettled(mergeStyle, mergeArea);
