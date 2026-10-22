@@ -272,6 +272,8 @@ export function createBrushInput(canvas, { getPressureEffect, getStyle, toPaint,
   return {
     // True while a finger is painting.
     get painting() { return pointerId !== null; },
+    // True if input arrived that hasn't been taken yet (e.g. a stroke that just ended).
+    get hasPendingInput() { return queue.length > 0; },
     // Drop the stroke in progress; its finger is ignored until it lifts.
     cancel() {
       if (pointerId === null) return;

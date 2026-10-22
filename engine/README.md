@@ -31,6 +31,16 @@ engine.setBrush({ color: '#5f7d9c', water: 0.3, size: 32, wet: false, taper: 1.5
 | `engine.onPointer(({ x, y, down }) => …)` | Where paint is landing, in client coordinates: on every move while painting, and once on lift/cancel (`down: false`). Returns an unsubscribe function. |
 | `engine.drawPreview(ctx2d)` | Draws the whole painting, unzoomed, into a 2D canvas at that canvas's pixel size. |
 | `engine.onHistoryChange(({ canUndo, canRedo }) => …)` | Called right away with the current state, then on every change. Returns an unsubscribe function. |
+| `await engine.finishDrying({ durationMs = 1500 })` | Dries all wet paint in about `durationMs` (rims darken, granulation settles) and resolves when nothing is wet. No new stroke can start meanwhile. |
+| `engine.onChange(() => …)` | Called after a stroke ends, and after undo, redo, clear and `finishDrying`. Returns an unsubscribe function. |
+| `await engine.save()` | The painting as a `Blob`: dried and wet paint, and how far each wet part has dried. |
+| `await engine.load(data)` | Restores a save (`Blob` or `ArrayBuffer`) into an engine with the same canvas shape; drying carries on. Undo history starts empty. Rejects with a readable error, leaving the painting untouched, if the data is from another format version, another canvas shape, or damaged. |
+
+### Export
+
+Draw the finished painting at the stored resolution with `drawPreview` on a 1200 × 1500 2D canvas
+(after `finishDrying`, since wet paint is shown slightly darker). It uses the same drawing as the
+screen, unzoomed, with the paper at full resolution.
 
 ### Brush
 
@@ -56,6 +66,18 @@ engine.setBrush({ color: '#5f7d9c', water: 0.3, size: 32, wet: false, taper: 1.5
   beyond it the oldest steps are forgotten, so a run of very large washes can keep fewer than 20 steps.
 - Undo removes a step's changes in the tiles it touched. Paint elsewhere keeps drying; where restored
   paint and its neighbours are both wet, the restored paint keeps today's water level so they dry together.
+
+## Save format
+
+- Version 1: `'PMWC'`, the format version, a compression flag, then the gzip-compressed body.
+- Only tiles with paint are stored, as the exact half-float values on the GPU (lossless: saving,
+  loading and saving again gives identical data), delta-filtered so smooth paint compresses well.
+- Wet tiles also store their wetness and how long ago they were wetted, so drying continues.
+- A checksum and size checks catch damaged data.
+- Measured: one medium stroke ≈ 220–260 KB; three strokes ≈ 600–690 KB. A fully painted stamp is
+  expected around 1–2 MB (more while much of it is still wet).
+- Reading the paint back happens in the background and the packing runs in a worker, so a save
+  doesn't hold up painting.
 
 ## Notes
 

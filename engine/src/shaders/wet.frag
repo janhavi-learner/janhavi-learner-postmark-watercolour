@@ -37,6 +37,7 @@ uniform float u_evaporate;       // water lost this step
 uniform float u_dampFade;        // how much of the damp phase passes this step
 uniform float u_edgeStrength;    // extra pigment at the rim when it dries, relative to the puddle's own
 uniform float u_probePx;         // how far to look (paint px) when checking if the puddle around is drying
+uniform float u_allDrying;       // 1 = everything dries in this step (finishDrying's last step): every edge gets its rim
 
 // Paint layers are half-float: around 1.0 they can only store steps of ~0.001. A state saved
 // just above 1.0 could round down to exactly 1.0 and read as "already dry", skipping the
@@ -159,7 +160,7 @@ void main() {
     // bled water and dries straight away keeps only the trace of pigment it received.
     vec4 puddle = texture(u_puddle, v_uv);
     float wasWet = c.a > 1.0 ? 1.0 : 0.0; // just-dried (damp) pixels sit at exactly 1.0: not wet
-    float rim = pow(clamp((1.0 - puddle.a) * 2.0, 0.0, 1.0), 2.5) * wasWet * puddleDrying(p, size);
+    float rim = pow(clamp((1.0 - puddle.a) * 2.0, 0.0, 1.0), 2.5) * wasWet * max(puddleDrying(p, size), u_allDrying);
     vec3 puddlePigment = puddle.rgb / max(puddle.a, 0.05);
     outWet = vec4(0.0, 0.0, 0.0, 1.0); // start of the damp phase
     outDeposit = vec4(pigment + u_edgeStrength * rim * puddlePigment, 1.0);

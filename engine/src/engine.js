@@ -17,6 +17,7 @@ import {
 import { setErrorHandler } from './errors.js';
 import { createBrushInput } from './brush.js';
 import { preparePaper } from './paper.js';
+import SaveWorker from './save-worker.js?worker&inline';
 import paperUrl from '../paper.jpg';
 import fullscreenVert from './shaders/fullscreen.vert?raw';
 import compositeFrag from './shaders/composite.frag?raw';
@@ -51,6 +52,14 @@ const MARGIN_TILES = 1;
 // Undo store: pages of 16 × 16 tiles (8 MB each). Above this many pages, the oldest steps go.
 const STORE_PAGE = 1024;
 const STORE_BUDGET_PAGES = 16; // 128 MB
+
+// finishDrying runs the wet simulation in long steps, at most this many per frame. While paint is
+// still fresh (it bleeds outward in its first seconds) the steps are shorter, so the bleed
+// matches natural drying.
+const FAST_STEP = 1 / 10;
+const FAST_STEP_FRESH = 1 / 30;
+const FRESH_SECONDS = 6;
+const FAST_STEPS_PER_FRAME = 6;
 
 // Water brush: share of the dried pigment under it that dissolves back into the wet paint.
 const WATER_LIFT = 0.4;
@@ -217,12 +226,23 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
   const tilesX = Math.ceil(W / TILE);
   const tilesY = Math.ceil(H / TILE);
   const wetSince = new Float64Array(tilesX * tilesY).fill(-Infinity); // sim time each tile was last wetted
+  const wetLevel = new Float32Array(tilesX * tilesY);                  // most water put on it since (stroke water level)
   const painted = new Uint8Array(tilesX * tilesY);                     // 1 once a tile has any paint
   let simClock = 0;
-  // How long after its last wetting a tile can still be wet (wettest stroke + damp phase, with margin).
-  // Uses the current slider, so raising the drying time mid-way never freezes paint half-wet.
-  const wetDuration = () => (((0.5 + 1) / 0.8) * 1.2 + DAMP_SHARE) * tuning.dryingTime + 1;
-  const tileWet = (i) => simClock - wetSince[i] < wetDuration();
+  // Water evaporates at 0.8 / dryingTime per second, so `level` water takes level / 0.8 drying times.
+  const evaporateTime = (level) => (level / 0.8) * tuning.dryingTime;
+  // How long after its last wetting a tile can still be wet or damp (its water, the damp phase,
+  // and a safety margin). Uses the current slider, so changing the drying time mid-way never
+  // freezes paint half-wet.
+  const wetDuration = (i) => evaporateTime(wetLevel[i]) * 1.2 + DAMP_SHARE * tuning.dryingTime + 1;
+  const tileWet = (i) => simClock - wetSince[i] < wetDuration(i);
+  // Wets tile i now with `level` water (keeps the most water it has had while wet).
+  function wetTile(i, level) {
+    wetLevel[i] = tileWet(i) ? Math.max(wetLevel[i], level) : level;
+    wetSince[i] = simClock;
+  }
+  // The wettest stroke's water level, for tiles whose own level isn't known (undo, load).
+  const MAX_LEVEL = (0.5 + 1) / 0.8;
   const tileRect = (i) => {
     const x = (i % tilesX) * TILE;
     const y = Math.floor(i / tilesX) * TILE;
@@ -265,6 +285,10 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
   const historyListeners = new Set();
   const historyState = () => ({ canUndo: undoStack.length > 0, canRedo: redoStack.length > 0 });
   const notifyHistory = () => historyListeners.forEach((cb) => cb(historyState()));
+  // onChange listeners hear about strokes, undo, redo, clear and finished drying, at the end of
+  // the frame they happen in (so a save() they start sees the finished change).
+  const changeListeners = new Set();
+  let changed = false;
 
   function allocSlot() {
     for (;;) {
@@ -327,7 +351,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
       gl.uniform1f(u.u_hasSnap, t.wet ? 1 : 0);
       gl.bindVertexArray(emptyVao);
       drawFullscreen(gl);
-      if (t.wet) wetSince[i] = Math.max(wetSince[i], simClock);
+      if (t.wet) wetTile(i, MAX_LEVEL);
       if (t.dry || t.wet) painted[i] = 1;
     }
   }
@@ -351,6 +375,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     restoreStep(step);
     releaseStep(step);
     notifyHistory();
+    changed = true;
   }
   // Clear is one undo step.
   function clear() {
@@ -365,6 +390,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     painted.fill(0);
     wetSince.fill(-Infinity);
     notifyHistory();
+    changed = true;
   }
 
   const emptyVao = gl.createVertexArray();
@@ -452,7 +478,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     const tiles = tilesIn(area, MARGIN_TILES);
     if (activeStep) touch(activeStep, tiles); // save these tiles for undo before changing them
     for (const i of tiles) {
-      wetSince[i] = simClock;
+      wetTile(i, style.waterLevel);
       painted[i] = 1;
     }
     const r = { x: Math.max(0, Math.floor(area.x0)), y: Math.max(0, Math.floor(area.y0)) };
@@ -557,9 +583,10 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
   }
 
   // One step of wet paint: blend, evaporate, and drop dried pigment (with its rim) onto the dry layer.
-  // Only runs inside the rectangle that may be wet.
+  // Only runs inside the rectangle that may be wet. finishDrying uses long steps (up to 1/10 s),
+  // and `blur: false` reuses the last rim blur to save time.
   let stepCount = 0;
-  function wetStep(dt) {
+  function wetStep(dt, { blur = true, forceDry = false } = {}) {
     const bounds = wetBounds();
     if (!bounds) {
       // Everything has dried: make sure both wet layers are empty, then stop until the next stroke.
@@ -571,7 +598,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
       return;
     }
     wasWet = true;
-    blurPuddleShape(bounds);
+    if (blur || !puddle) blurPuddleShape(bounds);
 
     const { program, uniforms: u } = programs.wet;
     gl.bindFramebuffer(gl.FRAMEBUFFER, wetStepFbo.get(wetRead));
@@ -585,9 +612,12 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     gl.uniform1f(u.u_paperStd, paperStd);
     // Fibres about 1.5 CSS px across.
     gl.uniform2f(u.u_fiberScale, layoutW / 1.5, layoutW / aspect / 1.5);
+    // A step longer than a 60Hz frame (slow phones, finishDrying) reaches further, so paint spreads
+    // the same amount per second of drying however the time is cut into steps.
+    const frames = Math.max(dt * 60, 1);
     // Neighbour distance grows with spread speed; its direction turns by the golden angle each step.
     // Steps cycle through far, middle and nearest neighbours, so all pixels stay linked.
-    const far = (1 + 4 * tuning.spread) * simScale;
+    const far = (1 + 4 * tuning.spread) * simScale * Math.sqrt(frames);
     const reachPx = [far, Math.max(1, far / 3), 1][stepCount % 3];
     const angle = stepCount++ * 2.39996;
     let ox = Math.round(Math.cos(angle) * reachPx);
@@ -598,9 +628,10 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     const perStep = Math.min(dt * 60, 1);
     gl.uniform1f(u.u_pigmentFlow, tuning.spread > 0 ? 0.24 * perStep : 0);
     gl.uniform1f(u.u_waterFlow, 0.24 * perStep);
-    // Outward bleeding follows spread speed too.
-    gl.uniform1f(u.u_bleed, 0.5 * tuning.spread * perStep);
-    gl.uniform1f(u.u_evaporate, (dt * 0.8) / tuning.dryingTime);
+    // Outward bleeding follows spread speed too (capped so a long step can't push out more water than there is).
+    gl.uniform1f(u.u_bleed, 0.5 * tuning.spread * perStep * Math.min(frames, 1.25));
+    gl.uniform1f(u.u_evaporate, forceDry ? 100 : (dt * 0.8) / tuning.dryingTime);
+    gl.uniform1f(u.u_allDrying, forceDry ? 1 : 0);
     gl.uniform1f(u.u_dampFade, dt / (DAMP_SHARE * tuning.dryingTime));
     gl.uniform1f(u.u_edgeStrength, tuning.edgeStrength);
     gl.uniform1f(u.u_probePx, Math.max(2, Math.round(4 * simScale)));
@@ -658,6 +689,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     notifyHistory();
   }
 
+  const endOfFrame = []; // callbacks for the end of the next frame
   // The whole current stroke's area, so it can be given an even water level when the finger lifts.
   let strokeArea = null;
   let lastTime = 0;
@@ -697,6 +729,7 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
         mergeStyle = null;
         mergeArea = null;
         tailCover = 0;
+        changed = true;
       } else if (event.cancel) {
         cancelStroke();
         strokeArea = null;
@@ -710,11 +743,209 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     }
     if (mergeStyle) mergeSettled(mergeStyle, mergeArea);
 
-    wetStep(dt);
-    simClock += dt;
+    if (finishing && !brushInput.painting) {
+      fastForward(now);
+    } else {
+      wetStep(dt);
+      simClock += dt;
+    }
 
     composite(null, canvas.width, canvas.height, view);
+    if (changed) {
+      changed = false;
+      changeListeners.forEach((cb) => cb());
+    }
+    endOfFrame.splice(0).forEach((resolve) => resolve());
     requestAnimationFrame(frame);
+  }
+
+  // --- Finish drying: run the drying faster so it ends in about `durationMs`.
+  // Steps are longer than a frame but spread paint just as natural drying does (see wetStep).
+  let finishing = null; // { resolve, promise, endAt }
+  let appInput = true;  // what the app asked for with setInputEnabled
+  const applyInput = () => brushInput.setEnabled(appInput && !finishing);
+  let lastFast = 0;
+  let fastSteps = 0;
+  function fastForward(now) {
+    // Simulated drying left: until the last wet tile has dried (and finished its damp phase).
+    // (The damp phase is left out: nothing visible happens in it once the paint around has dried.)
+    let left = 0;
+    let youngest = Infinity;
+    for (let i = 0; i < wetSince.length; i++) {
+      if (!tileWet(i)) continue;
+      left = Math.max(left, wetSince[i] + evaporateTime(wetLevel[i]) * 1.05 + 0.25 - simClock);
+      youngest = Math.min(youngest, simClock - wetSince[i]);
+    }
+    if (left > 0) {
+      const step = youngest < FRESH_SECONDS ? FAST_STEP_FRESH : FAST_STEP;
+      const frameTime = Math.min(lastFast ? now - lastFast : 1 / 60, 0.1);
+      const timeLeft = Math.max(finishing.endAt - now, 1 / 60);
+      const steps = Math.min(Math.max(Math.ceil((left * Math.min(frameTime / timeLeft, 1)) / step), 1), FAST_STEPS_PER_FRAME);
+      for (let k = 0; k < steps; k++) {
+        wetStep(step, { blur: (fastSteps++ % 3) === 0 });
+        simClock += step;
+      }
+      lastFast = now;
+      return;
+    }
+    // Estimated dry: one last step dries any pixel still holding water on the spot (with its rim),
+    // then the wet layers are emptied.
+    wetStep(FAST_STEP, { forceDry: true });
+    wetSince.fill(-Infinity);
+    wetStep(FAST_STEP);
+    const done = finishing;
+    finishing = null;
+    lastFast = 0;
+    applyInput();
+    changed = true;
+    done.resolve();
+  }
+  function finishDrying({ durationMs = 1500 } = {}) {
+    if (!finishing) {
+      let resolve;
+      const promise = new Promise((r) => { resolve = r; });
+      finishing = { resolve, promise, endAt: performance.now() / 1000 + durationMs / 1000 };
+      applyInput();
+    }
+    return finishing.promise;
+  }
+
+  // --- Save and load. Paint layers are read back as half floats (exact), only where there's paint.
+  // Reading uses GPU buffers that fill in the background (no waiting on the GPU), and the packing
+  // and compression run in a worker, so a save doesn't stall painting.
+  let readsHalf = null; // can this GPU read half floats directly? (otherwise floats, converted in the worker)
+  // Starts reading a rectangle of a layer; resolves with its pixels (RGBA, rows bottom-up).
+  function readLater(target, r) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    if (readsHalf === null) {
+      readsHalf = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT) === gl.RGBA
+        && gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE) === gl.HALF_FLOAT;
+    }
+    const count = r.w * r.h * 4;
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, count * (readsHalf ? 2 : 4), gl.STREAM_READ);
+    gl.readPixels(r.x, r.y, r.w, r.h, gl.RGBA, readsHalf ? gl.HALF_FLOAT : gl.FLOAT, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return () => {
+      const pixels = readsHalf ? new Uint16Array(count) : new Float32Array(count);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buffer);
+      gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, pixels);
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      gl.deleteBuffer(buffer);
+      return pixels;
+    };
+  }
+  // Resolves once the GPU has done everything asked of it so far (checked once per frame).
+  function gpuDone() {
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    return new Promise((resolve) => {
+      const check = () => {
+        const status = gl.clientWaitSync(sync, 0, 0);
+        if (status === gl.TIMEOUT_EXPIRED) return requestAnimationFrame(check);
+        gl.deleteSync(sync);
+        resolve();
+      };
+      check();
+    });
+  }
+  // The rectangle around these tiles.
+  function tilesRect(indices) {
+    const rects = indices.map(tileRect);
+    const x = Math.min(...rects.map((t) => t.x));
+    const y = Math.min(...rects.map((t) => t.y));
+    return { x, y, w: Math.max(...rects.map((t) => t.x + t.w)) - x, h: Math.max(...rects.map((t) => t.y + t.h)) - y };
+  }
+
+  const worker = new SaveWorker();
+  let jobId = 0;
+  const jobs = new Map();
+  worker.onmessage = ({ data }) => {
+    const job = jobs.get(data.id);
+    jobs.delete(data.id);
+    if (data.error) job.reject(new Error(data.error));
+    else job.resolve(data);
+  };
+  function runJob(message, transfer) {
+    const id = ++jobId;
+    return new Promise((resolve, reject) => {
+      jobs.set(id, { resolve, reject });
+      worker.postMessage({ ...message, id }, transfer);
+    });
+  }
+
+  // Ask once, now: the first query can make the browser wait for the GPU, which a save shouldn't.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dry.fbo);
+  readsHalf = gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_FORMAT) === gl.RGBA
+    && gl.getParameter(gl.IMPLEMENTATION_COLOR_READ_TYPE) === gl.HALF_FLOAT;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // Resolves at the end of the next frame, once input that already arrived has been painted in.
+  const afterFrame = () => new Promise((resolve) => endOfFrame.push(resolve));
+
+  const layout = { width: W, height: H, tile: TILE };
+  async function save() {
+    // A stroke that has ended but not been painted in yet belongs in this save.
+    if (brushInput.hasPendingInput) await afterFrame();
+    const dryIdx = [];
+    const wetIdx = [];
+    for (let i = 0; i < painted.length; i++) {
+      if (painted[i]) dryIdx.push(i);
+      if (tileWet(i)) wetIdx.push(i);
+    }
+    // Both reads are queued now, so the save is exactly this moment's painting.
+    const dryRect = dryIdx.length ? tilesRect(dryIdx) : null;
+    const wetRect = wetIdx.length ? tilesRect(wetIdx) : null;
+    const dryPixels = dryRect && readLater(dry, dryRect);
+    const wetPixels = wetRect && readLater(wetRead, wetRect);
+    const ages = wetIdx.map((i) => simClock - wetSince[i]);
+    await gpuDone();
+    const job = { op: 'encode', layout };
+    const transfer = [];
+    if (dryRect) {
+      job.dry = { pixels: dryPixels(), rect: dryRect, indices: dryIdx };
+      transfer.push(job.dry.pixels.buffer);
+    }
+    if (wetRect) {
+      job.wet = { pixels: wetPixels(), rect: wetRect, indices: wetIdx, ages };
+      transfer.push(job.wet.pixels.buffer);
+    }
+    return (await runJob(job, transfer)).blob;
+  }
+  function uploadTile(target, index, rgba) {
+    const t = tileRect(index);
+    gl.bindTexture(gl.TEXTURE_2D, target.tex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, t.x, t.y, t.w, t.h, gl.RGBA, gl.HALF_FLOAT, rgba);
+  }
+  async function load(data) {
+    // Unpacked in the worker; throws (a clear message) before anything here changes.
+    const { dryTiles, wetTiles } = (await runJob({ op: 'decode', data, layout }, [])).result;
+    brushInput.cancel();
+    for (const t of [settled, merged, tail, dry, wetRead, wetWrite]) clearTarget(gl, t);
+    [...undoStack, ...redoStack, ...pendingRedo].forEach(releaseStep);
+    undoStack.length = 0;
+    redoStack.length = 0;
+    pendingRedo = [];
+    activeStep = null;
+    painted.fill(0);
+    wetSince.fill(-Infinity);
+    for (const { index, values } of dryTiles) {
+      const rgba = new Uint16Array((values.length / 3) * 4);
+      for (let i = 0, o = 0; i < values.length; i += 3, o += 4) rgba.set(values.subarray(i, i + 3), o);
+      uploadTile(dry, index, rgba);
+      painted[index] = 1;
+    }
+    for (const { index, age, values } of wetTiles) {
+      uploadTile(wetRead, index, values);
+      uploadTile(wetWrite, index, values);
+      wetLevel[index] = MAX_LEVEL;
+      wetSince[index] = simClock - age; // drying carries on from where it was
+      painted[index] = 1;
+    }
+    wasWet = wetTiles.length > 0;
+    notifyHistory();
   }
   requestAnimationFrame(frame);
 
@@ -771,7 +1002,23 @@ export async function createEngine(canvas, { tune = false, onError } = {}) {
     // Drop the stroke in progress completely (no paint, no undo step). Its finger is ignored until it lifts.
     cancelStroke: () => brushInput.cancel(),
     // false: no new stroke can start (e.g. during a pinch).
-    setInputEnabled: (on) => brushInput.setEnabled(on),
+    setInputEnabled(on) {
+      appInput = !!on;
+      applyInput();
+    },
+    // Runs the drying faster so all wet paint settles in about `durationMs`; resolves when nothing
+    // is wet. No new stroke can start meanwhile.
+    finishDrying,
+    // Called after a stroke ends, and after undo, redo, clear and finishDrying. Returns an unsubscribe function.
+    onChange(cb) {
+      changeListeners.add(cb);
+      return () => changeListeners.delete(cb);
+    },
+    // The painting (dried and wet paint, and how far it has dried) as a Blob.
+    save,
+    // Restores a save into this engine (same canvas shape); drying carries on. Undo history starts empty.
+    // Rejects with a clear error, leaving the painting untouched, if the data is old or damaged.
+    load,
     // Called with { x, y, down } in client coordinates of where paint lands: on every move while
     // painting, and once on lift (down: false). Returns a function that unsubscribes.
     onPointer(cb) {
