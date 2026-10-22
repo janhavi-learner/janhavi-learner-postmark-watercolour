@@ -21,6 +21,7 @@ precision highp float;
 in vec2 v_uv;
 layout(location = 0) out vec4 outWet;      // next state: pigment (rgb), wetness state (a)
 layout(location = 1) out vec4 outDeposit;  // pigment that dried this step (added to the dry layer)
+layout(location = 2) out vec4 outCalm;     // next water-brush mark (r): travels with the water
 
 uniform sampler2D u_wet;
 uniform sampler2D u_puddle;      // blurred puddle: wet pigment around here (rgb), shape (a: ~1 inside, ~0.5 at the edge)
@@ -37,6 +38,10 @@ uniform float u_evaporate;       // water lost this step
 uniform float u_dampFade;        // how much of the damp phase passes this step
 uniform float u_edgeStrength;    // extra pigment at the rim when it dries, relative to the puddle's own
 uniform float u_probePx;         // how far to look (paint px) when checking if the puddle around is drying
+uniform sampler2D u_calm;        // water-brush mark (r): 1 where the water brush's water is. Wet paint it
+                                 // touches picks it up, so its whole puddle dries soft, with no rim
+uniform sampler2D u_dry;         // dried pigment, which the water brush's water re-dissolves as it spreads
+uniform float u_calmLift;        // share of it re-dissolved where that water arrives
 uniform float u_allDrying;       // 1 = everything dries in this step (finishDrying's last step): every edge gets its rim
 
 // Paint layers are half-float: around 1.0 they can only store steps of ~0.001. A state saved
@@ -62,8 +67,11 @@ float absorbency(vec2 uv) {
   return clamp(0.55 - 0.45 * bump + fiber * 0.9, 0.05, 1.0);
 }
 
-// Water a wet pixel pushes into each dry neighbour per unit of absorbency.
-float bleedPush(vec4 s) { return u_bleed * max(s.a - 1.0 - BLEED_ABOVE, 0.0); }
+// Water the water brush lays spreads this many times faster into dry paper than paint does.
+const float CALM_BLEED = 3.0;
+
+// Water a wet pixel pushes into each dry neighbour per unit of absorbency (`calm`: its water-brush mark).
+float bleedPush(vec4 s, float calm) { return u_bleed * (1.0 + (CALM_BLEED - 1.0) * calm) * max(s.a - 1.0 - BLEED_ABOVE, 0.0); }
 
 // The rim belongs to the moment the puddle dries, not to one edge pixel that dries early
 // (e.g. a thin bled fringe). 1 if the wet paint around this pixel is nearly out of water
@@ -87,7 +95,10 @@ void main() {
   ivec2 size = textureSize(u_wet, 0);
   vec2 texel = 1.0 / vec2(size);
   vec4 c = texelFetch(u_wet, p, 0);
+  float calmHere = texelFetch(u_calm, p, 0).r;
+  float calmNext = calmHere;
   outDeposit = vec4(0.0);
+  outCalm = vec4(0.0);
 
   // Four neighbours in a rotating direction: cheap, and over a few steps it reaches evenly all ways.
   // Exact pixels (no filtering), so whatever one pixel gives, its neighbour receives:
@@ -109,7 +120,7 @@ void main() {
     // Wet: blend with wet neighbours, bleed into dry ones.
     float water = c.a - 1.0;
     vec3 concentration = c.rgb / max(water, 1e-3);
-    float push = bleedPush(c);
+    float push = bleedPush(c, calmHere);
     vec3 dPigment = vec3(0.0);
     float dWater = 0.0;
     float bledOut = 0.0;
@@ -117,6 +128,7 @@ void main() {
       float k = link(c.a, n[i].a);
       dPigment += k * (n[i].rgb - c.rgb);
       dWater += k * (n[i].a - c.a);
+      if (k > 0.0) calmNext = max(calmNext, texelFetch(u_calm, q[i], 0).r);
       if (n[i].a <= 1.0 && push > 0.0) bledOut += push * absorbency((vec2(q[i]) + 0.5) * texel);
     }
     pigment = max(c.rgb + u_pigmentFlow * dPigment - concentration * bledOut * BLEED_CARRY, 0.0);
@@ -126,10 +138,12 @@ void main() {
     float bledIn = 0.0;
     vec3 pigmentIn = vec3(0.0);
     for (int i = 0; i < 4; i++) {
-      float push = n[i].a > 1.0 ? bleedPush(n[i]) : 0.0;
+      float calmThere = texelFetch(u_calm, q[i], 0).r;
+      float push = n[i].a > 1.0 ? bleedPush(n[i], calmThere) : 0.0;
       if (push <= 0.0) continue;
       bledIn += push;
       pigmentIn += n[i].rgb / max(n[i].a - 1.0, 1e-3) * push * BLEED_CARRY;
+      calmNext = max(calmNext, calmThere);
     }
     if (bledIn <= 0.0) {
       // Nothing arrives: damp slowly turns fully dry.
@@ -140,6 +154,13 @@ void main() {
     float soak = absorbency(v_uv);
     pigment = pigmentIn * soak;
     state = 1.0 + bledIn * soak - u_evaporate;
+    if (state > DRY_LINE && calmNext > 0.0) {
+      // The water brush's water soaks into dried paint: it dissolves it again, like under the
+      // brush, so the paint it spreads over mixes in instead of piling up on top (no dark band).
+      vec3 lifted = texelFetch(u_dry, p, 0).rgb * u_calmLift * calmNext;
+      pigment += lifted;
+      outDeposit = vec4(-lifted, 0.0); // taken off the dry layer
+    }
     if (state <= DRY_LINE) {
       // Only a trace arrived and it dried at once: keep the trace of pigment, but the paper
       // stays as it was. Marking it damp would make the puddle look wider than its wet part
@@ -152,6 +173,7 @@ void main() {
 
   if (state > DRY_LINE) {
     outWet = vec4(pigment, state);
+    outCalm = vec4(calmNext);
   } else {
     // Dried this step. Rim = 1 right at the puddle edge, fading inward.
     // The rim's extra pigment comes from the puddle around it (its average strength), not just
@@ -161,6 +183,8 @@ void main() {
     vec4 puddle = texture(u_puddle, v_uv);
     float wasWet = c.a > 1.0 ? 1.0 : 0.0; // just-dried (damp) pixels sit at exactly 1.0: not wet
     float rim = pow(clamp((1.0 - puddle.a) * 2.0, 0.0, 1.0), 2.5) * wasWet * max(puddleDrying(p, size), u_allDrying);
+    // Paint the water brush's water reached dries soft: no rim.
+    rim *= 1.0 - calmHere;
     vec3 puddlePigment = puddle.rgb / max(puddle.a, 0.05);
     outWet = vec4(0.0, 0.0, 0.0, 1.0); // start of the damp phase
     outDeposit = vec4(pigment + u_edgeStrength * rim * puddlePigment, 1.0);

@@ -49,9 +49,11 @@ screen, unzoomed, with the paper at full resolution.
   and gets softer edges. Near 0 the edge stays crisp.
 - `size`: diameter in CSS pixels **on screen**. Zoomed in with `setView`, the same size paints a finer
   line on the paper (at scale 4 a 6px brush is 1.5px on the unzoomed stamp).
-- `wet`: `true` = water brush. It only blends: colours and values under it mix softly with their
-  neighbours (dried with dried, wet with wet), reaching about a quarter of the brush's width. It adds
-  no water or pigment and changes no wetness, so it leaves no new edges, rims or blooms.
+- `wet`: `true` = water brush. It lays a lot of clean water (`water` is ignored) that re-dissolves most
+  of the dried paint under it. The water spreads out well past the brush, dissolving the dried paint it
+  reaches too, so colours run together and mix. It adds no pigment. Paint its water reaches dries soft,
+  with no dark rim. The water brush's marks aren't saved or undone, so paint loaded or undone while still
+  wet dries with a normal rim.
 - `taper`: length of the thin start/end, in brush widths (0 = none).
 - `offsetPx`: paint lands this many on-screen pixels above the finger (0 = under the finger).
 - `offsetRampPx`: the offset starts at 0 and grows smoothly to `offsetPx` over this much finger movement.
@@ -62,7 +64,7 @@ screen, unzoomed, with the paper at full resolution.
 - The painting is stored at 1200 px wide (1200 × 1500 for a 4:5 stamp), whatever the screen.
   Blending, bleeding and rim widths are scaled so they look the same in CSS pixels at any size.
 - The wet simulation only runs inside the rectangle that may still be wet.
-- GPU memory: about 120 MB of working layers (seven 1200 × 1500 half-float layers plus the rim-blur mask).
+- GPU memory: about 120 MB of working layers (seven 1200 × 1500 half-float layers, the rim-blur mask and two small water-brush masks).
 - Undo saves 64 × 64 px tiles, only where a step changes the painting (a stroke plus one tile around it),
   and only tiles that hold paint. A medium stroke costs about 3–6 MB. The undo store is capped at 128 MB:
   beyond it the oldest steps are forgotten, so a run of very large washes can keep fewer than 20 steps.
