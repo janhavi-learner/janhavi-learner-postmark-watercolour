@@ -25,15 +25,30 @@ function fitStamp() {
   return cssW;
 }
 
-async function start() {
-  const cssW = fitStamp();
-  const engine = await createEngine(canvas, { tune: true, onError: showOnScreen });
-  engine.setBrush({ size: Math.round(cssW * 0.1) }); // a tenth of the stamp, as before
+// The page can start with no size at all (e.g. an embedded panel that is still opening).
+// Keep fitting the stamp until it has one; the engine waits for that before it starts.
+function fitWhenSized() {
+  return new Promise((done) => {
+    const check = () => {
+      const cssW = fitStamp();
+      if (cssW >= 1) done(cssW);
+      else requestAnimationFrame(check);
+    };
+    check();
+  });
+}
 
+async function start() {
+  let engine = null;
+  // Listen from the start, so a resize before the engine is ready still resizes the stamp.
   window.addEventListener('resize', () => {
     fitStamp();
-    engine.resize();
+    engine?.resize();
   });
+  const cssW = await fitWhenSized();
+  engine = await createEngine(canvas, { tune: true, onError: showOnScreen });
+  engine.setBrush({ size: Math.round(cssW * 0.1) }); // a tenth of the stamp, as before
+
   undoButton.addEventListener('click', () => engine.undo());
   redoButton.addEventListener('click', () => engine.redo());
   engine.onHistoryChange(({ canUndo, canRedo }) => {
